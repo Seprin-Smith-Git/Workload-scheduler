@@ -1,32 +1,41 @@
 """
 Dynamic XGBoost Workload Scheduler - GUI
+========================================
 
 Run:
-    python scheduler2_gui.py
+    python scheduler_nmap_gui.py
 
 Requirements:
     pip install requests xgboost matplotlib
 
-The GUI:
-- Lets you choose the number of client/worker devices.
-- Accepts one IP address per client.
-- Detects the client OS from /info.
-- Polls CPU/RAM utilization.
-- Uses the existing xgboost_model.json for worker selection.
-- Runs the remote /run endpoint.
-- Displays the scheduler response and a live transparent-blue comparison graph.
-- Saves the configured clients to scheduler_workers.json.
-- "Export to scheduler2.py" updates the WORKERS section in an existing scheduler2.py.
+Optional:
+    nmap - recommended for LAN discovery
+
+Features:
+- Dark dashboard
+- LAN discovery using nmap -sn, with a Python Flask-port fallback
+- Dynamic client count
+- Dropdown IP selection with duplicate prevention
+- Client / Flask-agent health checks
+- CPU/RAM/network telemetry
+- XGBoost model loading and probability-based worker selection
+- Robust Tkinter thread/callback handling
+- Manual and automatic task execution
+- Live transparent-blue CPU/RAM comparison graph
+- Resource gauges / summary cards
+- Saves configuration
+- Exports worker list into scheduler2.py
 """
 
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
-import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -48,80 +57,96 @@ from matplotlib.figure import Figure
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "xgboost_model.json"
 CONFIG_PATH = BASE_DIR / "scheduler_workers.json"
-SCHEDULER_PATH = BASE_DIR / "scheduler2.py"
+SCHEDULER_PATH = BASE_DIR / "scheduler_nmap_gui.py"
+
+FLASK_PORT = 5000
+HTTP_TIMEOUT = 3
+TASK_TIMEOUT = 90
+MAX_CLIENTS = 32
+HISTORY_LENGTH = 40
 
 
 # ----------------------------------------------------------------------
-# Worker/model logic
+# XGBoost
 # ----------------------------------------------------------------------
 
 def load_model():
     if xgb is None:
         raise RuntimeError(
-            "XGBoost is not installed. Run: pip install xgboost"
+            "XGBoost is not installed.\n\n"
+            "Run:\n"
+            "pip install xgboost"
         )
 
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Model not found:\n{MODEL_PATH}\n"
-            "Place xgboost_model.json beside this file."
+            f"XGBoost model not found:\n{MODEL_PATH}\n\n"
+            "Place xgboost_model.json beside this GUI."
         )
 
     model = xgb.XGBClassifier()
     model.load_model(str(MODEL_PATH))
+
+    if not hasattr(model, "classes_") or len(model.classes_) < 2:
+        # XGBoost JSON models can still predict correctly even when the
+        # sklearn wrapper does not expose classes_ in the expected way.
+        pass
+
     return model
 
 
-def get_info(worker):
-    try:
-        r = requests.get(worker["url"] + "/info", timeout=3)
-        r.raise_for_status()
-        data = r.json()
-
-        return {
-            "os": data.get("os", "Unknown"),
-            "cpu": float(data.get("cpu", 0)),
-            "memory": float(data.get("memory", 0)),
-            "network": float(data.get("network", 0)),
-        }
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
 def prepare_features(info):
+    """
+    Feature order must match the trained model:
+        CPU, memory, network
+    """
     return [[
-        float(info.get("cpu", 0)),
-        float(info.get("memory", 0)),
-        float(info.get("network", 0)),
+        float(info.get("cpu", 0.0)),
+        float(info.get("memory", 0.0)),
+        float(info.get("network", 0.0)),
     ]]
 
 
 def worker_probability(model, worker, info):
-    probabilities = model.predict_proba(prepare_features(info))[0]
+    probabilities = model.predict_proba(
+        prepare_features(info)
+    )[0]
 
-    # Existing project model:
-    # Class 0 = Windows
-    # Class 1 = Kali
+    if len(probabilities) < 2:
+        raise RuntimeError(
+            "The XGBoost model does not contain two classes."
+        )
+
+    # Existing project convention:
+    # class 0 = Windows
+    # class 1 = Kali/Linux
     windows_probability = float(probabilities[0])
     kali_probability = float(probabilities[1])
 
-    os_name = worker.get("os", "").lower()
+    os_name = str(
+        info.get("os", worker.get("os", ""))
+    ).strip().lower()
 
-    if os_name == "windows":
+    if "windows" in os_name:
         selected_probability = windows_probability
-    elif os_name in ("linux", "kali"):
+        selected_class = "Windows"
+    elif os_name in ("linux", "kali") or "linux" in os_name:
         selected_probability = kali_probability
+        selected_class = "Kali/Linux"
     else:
-        # Keep the original project's named-worker behavior as a fallback.
         name = worker.get("name", "").lower()
-        selected_probability = (
-            kali_probability if "kali" in name else windows_probability
-        )
+        if "kali" in name or "linux" in name:
+            selected_probability = kali_probability
+            selected_class = "Kali/Linux"
+        else:
+            selected_probability = windows_probability
+            selected_class = "Windows"
 
     return {
         "windows": windows_probability,
         "kali": kali_probability,
         "selected": selected_probability,
+        "selected_class": selected_class,
     }
 
 
@@ -130,7 +155,12 @@ def find_best_worker(model, available):
     best_probability = -1.0
 
     for item in available:
-        probs = worker_probability(model, item["worker"], item["info"])
+        probs = worker_probability(
+            model,
+            item["worker"],
+            item["info"]
+        )
+
         item["probabilities"] = probs
 
         if probs["selected"] > best_probability:
@@ -141,20 +171,232 @@ def find_best_worker(model, available):
 
 
 # ----------------------------------------------------------------------
-# Persistence / scheduler.py export
+# Network / LAN discovery
+# ----------------------------------------------------------------------
+
+def get_local_subnets():
+    subnets = set()
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        local_ip = sock.getsockname()[0]
+        sock.close()
+
+        parts = local_ip.split(".")
+        if len(parts) == 4:
+            subnets.add(
+                ".".join(parts[:3]) + ".0/24"
+            )
+    except Exception:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        addresses = socket.gethostbyname_ex(hostname)[2]
+
+        for address in addresses:
+            parts = address.split(".")
+            if len(parts) == 4 and not address.startswith("127."):
+                subnets.add(
+                    ".".join(parts[:3]) + ".0/24"
+                )
+    except Exception:
+        pass
+
+    return sorted(subnets)
+
+
+def discover_with_nmap():
+    nmap = shutil.which("nmap")
+
+    if not nmap:
+        return []
+
+    found = set()
+
+    for subnet in get_local_subnets():
+        try:
+            result = subprocess.run(
+                [
+                    nmap,
+                    "-sn",
+                    "-n",
+                    subnet
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            for line in result.stdout.splitlines():
+                match = re.search(
+                    r"Nmap scan report for "
+                    r"(?:[^\s(]+\s+\()?(\d+\.\d+\.\d+\.\d+)",
+                    line
+                )
+
+                if match:
+                    found.add(match.group(1))
+
+        except Exception:
+            continue
+
+    return sorted(
+        found,
+        key=lambda ip: tuple(
+            int(x) for x in ip.split(".")
+        )
+    )
+
+
+def discover_flask_agents():
+    """
+    Fallback discovery.
+
+    It checks TCP/5000 because the project's client resource agents
+    expose Flask on port 5000.
+    """
+    addresses = set()
+
+    for subnet in get_local_subnets():
+        base = subnet.split("/")[0].rsplit(".", 1)[0]
+
+        for number in range(1, 255):
+            addresses.add(
+                f"{base}.{number}"
+            )
+
+    def check(ip):
+        try:
+            sock = socket.socket(
+                socket.AF_INET,
+                socket.SOCK_STREAM
+            )
+            sock.settimeout(0.15)
+
+            result = sock.connect_ex(
+                (ip, FLASK_PORT)
+            )
+
+            sock.close()
+
+            if result == 0:
+                return ip
+
+        except Exception:
+            pass
+
+        return None
+
+    found = set()
+
+    with ThreadPoolExecutor(max_workers=64) as pool:
+        for ip in pool.map(check, sorted(addresses)):
+            if ip:
+                found.add(ip)
+
+    return sorted(
+        found,
+        key=lambda ip: tuple(
+            int(x) for x in ip.split(".")
+        )
+    )
+
+
+def discover_lan_ips():
+    """
+    Prefer nmap host discovery.
+
+    If nmap is unavailable or finds nothing, use the Flask-port
+    fallback so this project remains usable without nmap.
+    """
+    found = discover_with_nmap()
+
+    if found:
+        return found, "nmap -sn"
+
+    found = discover_flask_agents()
+
+    return found, "Python TCP/5000 fallback"
+
+
+# ----------------------------------------------------------------------
+# Client communication
+# ----------------------------------------------------------------------
+
+def clean_ip(value):
+    value = value.strip()
+
+    if value.startswith("http://"):
+        value = value[7:]
+
+    if value.startswith("https://"):
+        value = value[8:]
+
+    if ":" in value:
+        value = value.rsplit(":", 1)[0]
+
+    return value.strip("/ ")
+
+
+def get_info(worker):
+    try:
+        response = requests.get(
+            worker["url"] + "/info",
+            timeout=HTTP_TIMEOUT
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        return {
+            "os": data.get("os", "Unknown"),
+            "cpu": float(data.get("cpu", 0)),
+            "memory": float(data.get("memory", 0)),
+            "network": float(data.get("network", 0)),
+        }
+
+    except Exception as exc:
+        return {
+            "error": str(exc)
+        }
+
+
+def run_remote_task(worker, command):
+    response = requests.post(
+        worker["url"] + "/run",
+        json={
+            "command": command
+        },
+        timeout=TASK_TIMEOUT
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+# ----------------------------------------------------------------------
+# Persistence / export
 # ----------------------------------------------------------------------
 
 def normalize_workers(rows):
     workers = []
 
-    for i, row in enumerate(rows, start=1):
-        ip = row.get("ip", "").strip()
+    for index, row in enumerate(rows, start=1):
+        ip = clean_ip(row.get("ip", ""))
+
         if not ip:
             continue
 
         workers.append({
-            "name": row.get("name") or f"Client-{i}",
-            "url": f"http://{ip}:5000",
+            "name": (
+                row.get("name")
+                or f"Client-{index}"
+            ),
+            "url": f"http://{ip}:{FLASK_PORT}"
         })
 
     return workers
@@ -162,7 +404,10 @@ def normalize_workers(rows):
 
 def save_config(workers):
     CONFIG_PATH.write_text(
-        json.dumps(workers, indent=4),
+        json.dumps(
+            workers,
+            indent=4
+        ),
         encoding="utf-8"
     )
 
@@ -172,32 +417,41 @@ def load_config():
         return []
 
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(
+            CONFIG_PATH.read_text(
+                encoding="utf-8"
+            )
+        )
+
         if isinstance(data, list):
             return data
+
     except Exception:
         pass
 
     return []
 
 
-def export_workers_to_scheduler(workers, target=SCHEDULER_PATH):
-    """
-    Replace the WORKERS list in scheduler2.py.
-
-    This keeps the original scheduler structure intact while making the
-    GUI-managed IP list available to the command-line scheduler as well.
-    """
+def export_workers_to_scheduler(
+    workers,
+    target=SCHEDULER_PATH
+):
     if not target.exists():
-        raise FileNotFoundError(f"Scheduler file not found: {target}")
+        raise FileNotFoundError(
+            f"Scheduler file not found:\n{target}"
+        )
 
-    source = target.read_text(encoding="utf-8")
+    source = target.read_text(
+        encoding="utf-8"
+    )
 
     replacement = (
         "# ============================================================\n"
         "# WORKERS\n"
         "# ============================================================\n\n"
-        "workers = " + repr(workers) + "\n"
+        "workers = "
+        + repr(workers)
+        + "\n"
     )
 
     pattern = (
@@ -217,117 +471,12 @@ def export_workers_to_scheduler(workers, target=SCHEDULER_PATH):
 
     if count != 1:
         raise RuntimeError(
-            "Could not locate the WORKERS section in scheduler2.py. "
-            "Make a backup and check the section header."
+            "Could not find the WORKERS section in scheduler2.py."
         )
 
-    target.write_text(updated, encoding="utf-8")
-
-
-# ----------------------------------------------------------------------
-# LAN discovery
-# ----------------------------------------------------------------------
-
-def get_local_subnets():
-    """
-    Determine likely local IPv4 /24 networks without requiring nmap.
-    Returns networks such as 192.168.1.0/24.
-    """
-    subnets = set()
-
-    # Primary route interface/address.
-    try:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        probe.connect(("8.8.8.8", 80))
-        local_ip = probe.getsockname()[0]
-        probe.close()
-
-        parts = local_ip.split(".")
-        if len(parts) == 4:
-            subnets.add(".".join(parts[:3]) + ".0/24")
-    except Exception:
-        pass
-
-    # Hostname-resolved addresses can catch another active interface.
-    try:
-        host = socket.gethostname()
-        for addr in socket.gethostbyname_ex(host)[2]:
-            parts = addr.split(".")
-            if len(parts) == 4 and not addr.startswith("127."):
-                subnets.add(".".join(parts[:3]) + ".0/24")
-    except Exception:
-        pass
-
-    return sorted(subnets)
-
-
-def discover_lan_ips():
-    """
-    Discover live LAN IPv4 addresses.
-
-    Preferred method:
-      nmap -sn <subnet>
-
-    Fallback:
-      Python TCP connect scan against common HTTP/Flask port 5000.
-      This fallback is intentionally conservative because a pure Python
-      ARP implementation would require extra platform-specific privileges.
-    """
-    discovered = set()
-    subnets = get_local_subnets()
-
-    # Try nmap first.
-    nmap = shutil.which("nmap") if "shutil" in globals() else None
-    if nmap:
-        for subnet in subnets:
-            try:
-                result = subprocess.run(
-                    [nmap, "-sn", "-n", subnet],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                for line in result.stdout.splitlines():
-                    match = re.search(
-                        r"Nmap scan report for (?:[^\s(]+\s+\()?(\d+\.\d+\.\d+\.\d+)",
-                        line
-                    )
-                    if match:
-                        discovered.add(match.group(1))
-            except Exception:
-                continue
-
-    # If nmap isn't installed or found nothing, use a Python fallback.
-    if not discovered:
-        local_ips = set()
-        for subnet in subnets:
-            base = subnet.split("/")[0].rsplit(".", 1)[0]
-            for last in range(1, 255):
-                local_ips.add(f"{base}.{last}")
-
-        def check_ip(ip):
-            # Port 5000 is especially useful for this project because
-            # your resource agents expose Flask on that port.
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.18)
-                ok = sock.connect_ex((ip, 5000)) == 0
-                sock.close()
-                if ok:
-                    return ip
-            except Exception:
-                pass
-            return None
-
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=64) as pool:
-            for ip in pool.map(check_ip, sorted(local_ips)):
-                if ip:
-                    discovered.add(ip)
-
-    return sorted(
-        discovered,
-        key=lambda ip: tuple(int(x) for x in ip.split("."))
+    target.write_text(
+        updated,
+        encoding="utf-8"
     )
 
 
@@ -336,88 +485,130 @@ def discover_lan_ips():
 # ----------------------------------------------------------------------
 
 class SchedulerGUI(tk.Tk):
-    BG = "#070b12"
-    PANEL = "#0d1420"
-    PANEL_2 = "#111b29"
-    TEXT = "#e8f0ff"
-    MUTED = "#8fa3bd"
+
+    BG = "#05080d"
+    PANEL = "#0b121c"
+    PANEL_2 = "#101b29"
+    PANEL_3 = "#0a1623"
+
+    TEXT = "#eaf4ff"
+    MUTED = "#8095ae"
+
     BLUE = "#35a7ff"
-    BLUE_2 = "#1976d2"
-    GREEN = "#36d399"
-    RED = "#ff5c70"
-    BORDER = "#1d2b3d"
+    BLUE_LIGHT = "#70c9ff"
+    BLUE_DARK = "#1674bd"
+
+    GREEN = "#35d399"
+    RED = "#ff5d73"
+    YELLOW = "#f5c451"
+
+    BORDER = "#1c2d42"
 
     def __init__(self):
         super().__init__()
 
-        self.title("Dynamic XGBoost Workload Scheduler")
-        self.geometry("1320x820")
-        self.minsize(1100, 720)
-        self.configure(bg=self.BG)
+        self.title(
+            "Dynamic XGBoost Workload Scheduler"
+        )
+
+        self.geometry("1450x920")
+        self.minsize(1180, 760)
+
+        self.configure(
+            bg=self.BG
+        )
 
         self.model = None
+
         self.client_rows = []
-        self.polling = False
-        self.history = {}
-        self.max_history = 30
-        self.last_snapshot = []
+
         self.discovered_ips = []
+
         self.discovery_running = False
 
+        self.refresh_running = False
+
+        self.history = {}
+
+        self.max_history = HISTORY_LENGTH
+
+        self.last_snapshot = []
+
+        self.selected_worker = None
+
         self._configure_style()
+
         self._build_header()
+
         self._build_config_panel()
+
         self._build_dashboard()
+
         self._build_graph()
+
         self._build_footer()
 
         existing = load_config()
+
         if existing:
             self._set_from_config(existing)
         else:
             self.count_var.set("2")
             self._rebuild_client_inputs()
 
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.protocol(
+            "WM_DELETE_WINDOW",
+            self.destroy
+        )
 
-    # ---------------- UI helpers ----------------
+    # ------------------------------------------------------------------
+    # Styling
+    # ------------------------------------------------------------------
 
     def _configure_style(self):
+
         style = ttk.Style(self)
+
         style.theme_use("clam")
 
         style.configure(
             "TFrame",
             background=self.BG
         )
+
         style.configure(
             "Panel.TFrame",
             background=self.PANEL
         )
+
         style.configure(
             "TLabel",
             background=self.PANEL,
             foreground=self.TEXT,
             font=("Segoe UI", 10)
         )
+
         style.configure(
             "Title.TLabel",
             background=self.BG,
             foreground=self.TEXT,
-            font=("Segoe UI Semibold", 22)
+            font=("Segoe UI Semibold", 23)
         )
+
         style.configure(
             "Sub.TLabel",
             background=self.BG,
             foreground=self.MUTED,
             font=("Segoe UI", 10)
         )
+
         style.configure(
             "PanelTitle.TLabel",
             background=self.PANEL,
             foreground=self.TEXT,
-            font=("Segoe UI Semibold", 12)
+            font=("Segoe UI Semibold", 11)
         )
+
         style.configure(
             "TButton",
             background=self.PANEL_2,
@@ -427,23 +618,33 @@ class SchedulerGUI(tk.Tk):
             padding=(12, 8),
             font=("Segoe UI Semibold", 9)
         )
+
         style.map(
             "TButton",
-            background=[("active", self.BLUE_2)],
-            foreground=[("active", "#ffffff")]
+            background=[
+                ("active", self.BLUE_DARK)
+            ],
+            foreground=[
+                ("active", "#ffffff")
+            ]
         )
+
         style.configure(
             "Accent.TButton",
-            background=self.BLUE_2,
+            background=self.BLUE_DARK,
             foreground="#ffffff",
-            bordercolor=self.BLUE_2,
-            padding=(15, 9),
+            bordercolor=self.BLUE_DARK,
+            padding=(14, 9),
             font=("Segoe UI Semibold", 9)
         )
+
         style.map(
             "Accent.TButton",
-            background=[("active", self.BLUE)]
+            background=[
+                ("active", self.BLUE)
+            ]
         )
+
         style.configure(
             "TEntry",
             fieldbackground=self.PANEL_2,
@@ -452,34 +653,80 @@ class SchedulerGUI(tk.Tk):
             bordercolor=self.BORDER,
             padding=7
         )
+
+        style.configure(
+            "TCombobox",
+            fieldbackground=self.PANEL_2,
+            background=self.PANEL_2,
+            foreground=self.TEXT,
+            arrowcolor=self.BLUE,
+            bordercolor=self.BORDER,
+            padding=6
+        )
+
+        style.map(
+            "TCombobox",
+            fieldbackground=[
+                ("readonly", self.PANEL_2)
+            ],
+            foreground=[
+                ("readonly", self.TEXT)
+            ]
+        )
+
         style.configure(
             "Treeview",
             background=self.PANEL_2,
             fieldbackground=self.PANEL_2,
             foreground=self.TEXT,
-            rowheight=30,
+            rowheight=31,
             bordercolor=self.BORDER,
             font=("Segoe UI", 9)
         )
+
         style.configure(
             "Treeview.Heading",
-            background="#162235",
+            background="#15253a",
             foreground=self.TEXT,
             relief="flat",
             font=("Segoe UI Semibold", 9)
         )
+
         style.map(
             "Treeview",
-            background=[("selected", "#164d80")],
-            foreground=[("selected", "#ffffff")]
+            background=[
+                ("selected", "#164d80")
+            ],
+            foreground=[
+                ("selected", "#ffffff")
+            ]
         )
 
-    def _build_header(self):
-        header = tk.Frame(self, bg=self.BG)
-        header.pack(fill="x", padx=24, pady=(20, 8))
+    # ------------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------------
 
-        left = tk.Frame(header, bg=self.BG)
-        left.pack(side="left")
+    def _build_header(self):
+
+        header = tk.Frame(
+            self,
+            bg=self.BG
+        )
+
+        header.pack(
+            fill="x",
+            padx=25,
+            pady=(20, 8)
+        )
+
+        left = tk.Frame(
+            header,
+            bg=self.BG
+        )
+
+        left.pack(
+            side="left"
+        )
 
         ttk.Label(
             left,
@@ -489,11 +736,20 @@ class SchedulerGUI(tk.Tk):
 
         ttk.Label(
             left,
-            text="Resource-aware client selection • Flask agents • live telemetry",
+            text=(
+                "Resource-aware execution • LAN discovery • "
+                "Flask agents • live telemetry"
+            ),
             style="Sub.TLabel"
-        ).pack(anchor="w", pady=(3, 0))
+        ).pack(
+            anchor="w",
+            pady=(3, 0)
+        )
 
-        self.status_var = tk.StringVar(value="● READY")
+        self.status_var = tk.StringVar(
+            value="● READY"
+        )
+
         self.status_label = tk.Label(
             header,
             textvariable=self.status_var,
@@ -501,96 +757,165 @@ class SchedulerGUI(tk.Tk):
             fg=self.GREEN,
             font=("Segoe UI Semibold", 10)
         )
-        self.status_label.pack(side="right", pady=12)
+
+        self.status_label.pack(
+            side="right",
+            pady=12
+        )
+
+    # ------------------------------------------------------------------
+    # Client configuration
+    # ------------------------------------------------------------------
 
     def _build_config_panel(self):
-        panel = ttk.Frame(self, style="Panel.TFrame")
-        panel.pack(fill="x", padx=24, pady=8)
 
-        top = tk.Frame(panel, bg=self.PANEL)
-        top.pack(fill="x", padx=16, pady=(13, 7))
+        panel = ttk.Frame(
+            self,
+            style="Panel.TFrame"
+        )
+
+        panel.pack(
+            fill="x",
+            padx=25,
+            pady=8
+        )
+
+        top = tk.Frame(
+            panel,
+            bg=self.PANEL
+        )
+
+        top.pack(
+            fill="x",
+            padx=16,
+            pady=(13, 7)
+        )
 
         ttk.Label(
             top,
             text="CLIENT CONFIGURATION",
             style="PanelTitle.TLabel"
-        ).pack(side="left")
+        ).pack(
+            side="left"
+        )
 
-        ttk.Label(
+        self.discovery_var = tk.StringVar(
+            value=(
+                "LAN discovery not run — "
+                "click Scan LAN"
+            )
+        )
+
+        tk.Label(
             top,
-            text="  Each client must expose Flask on port 5000",
-            style="TLabel"
-        ).pack(side="left")
+            textvariable=self.discovery_var,
+            bg=self.PANEL,
+            fg=self.MUTED,
+            font=("Segoe UI", 8)
+        ).pack(
+            side="left",
+            padx=15
+        )
 
-        controls = tk.Frame(panel, bg=self.PANEL)
-        controls.pack(fill="x", padx=16, pady=(0, 12))
+        controls = tk.Frame(
+            panel,
+            bg=self.PANEL
+        )
+
+        controls.pack(
+            fill="x",
+            padx=16,
+            pady=(0, 12)
+        )
 
         ttk.Label(
             controls,
             text="Client count:"
         ).pack(side="left")
 
-        self.count_var = tk.StringVar(value="2")
-        count_entry = ttk.Entry(
+        self.count_var = tk.StringVar(
+            value="2"
+        )
+
+        ttk.Entry(
             controls,
             textvariable=self.count_var,
             width=7
+        ).pack(
+            side="left",
+            padx=(7, 9)
         )
-        count_entry.pack(side="left", padx=(7, 10))
 
         ttk.Button(
             controls,
             text="Apply Count",
             command=self._rebuild_client_inputs
-        ).pack(side="left")
+        ).pack(
+            side="left"
+        )
 
         ttk.Button(
             controls,
             text="🔎 Scan LAN",
             style="Accent.TButton",
             command=self.scan_lan
-        ).pack(side="left", padx=(8, 4))
+        ).pack(
+            side="left",
+            padx=7
+        )
 
         ttk.Button(
             controls,
-            text="Save + Export to scheduler2.py",
+            text="Save + Export",
             command=self._save_and_export
-        ).pack(side="left", padx=4)
+        ).pack(
+            side="left",
+            padx=4
+        )
 
         ttk.Button(
             controls,
             text="Refresh Now",
             command=self.refresh_now
-        ).pack(side="right")
-
-        self.discovery_var = tk.StringVar(
-            value="LAN scan: not run — click Scan LAN to discover devices"
+        ).pack(
+            side="right"
         )
-        tk.Label(
-            panel,
-            textvariable=self.discovery_var,
-            bg=self.PANEL,
-            fg=self.MUTED,
-            font=("Segoe UI", 8)
-        ).pack(anchor="w", padx=16, pady=(0, 6))
 
-        self.client_input_frame = tk.Frame(panel, bg=self.PANEL)
-        self.client_input_frame.pack(fill="x", padx=16, pady=(0, 15))
+        self.client_input_frame = tk.Frame(
+            panel,
+            bg=self.PANEL
+        )
+
+        self.client_input_frame.pack(
+            fill="x",
+            padx=16,
+            pady=(0, 15)
+        )
 
     def _rebuild_client_inputs(self):
+
         try:
-            count = int(self.count_var.get())
-            if count < 1 or count > 32:
+            count = int(
+                self.count_var.get()
+            )
+
+            if count < 1 or count > MAX_CLIENTS:
                 raise ValueError
+
         except ValueError:
+
             messagebox.showerror(
                 "Invalid client count",
-                "Enter a whole number from 1 to 32."
+                f"Enter a whole number from 1 to {MAX_CLIENTS}."
             )
+
             return
 
         old = [
-            (row["name_var"].get(), row["ip_var"].get())
+            (
+                row["name_var"].get(),
+                row["ip_var"].get()
+            )
             for row in self.client_rows
         ]
 
@@ -599,9 +924,24 @@ class SchedulerGUI(tk.Tk):
 
         self.client_rows = []
 
-        for i in range(count):
-            name = old[i][0] if i < len(old) and old[i][0] else f"Client-{i+1}"
-            ip = old[i][1] if i < len(old) else ""
+        for index in range(count):
+
+            old_name = (
+                old[index][0]
+                if index < len(old)
+                else ""
+            )
+
+            old_ip = (
+                old[index][1]
+                if index < len(old)
+                else ""
+            )
+
+            name = (
+                old_name
+                or f"Client-{index + 1}"
+            )
 
             card = tk.Frame(
                 self.client_input_frame,
@@ -609,190 +949,337 @@ class SchedulerGUI(tk.Tk):
                 highlightbackground=self.BORDER,
                 highlightthickness=1
             )
+
             card.pack(
                 side="left",
                 fill="x",
                 expand=True,
-                padx=(0 if i == 0 else 5, 5)
+                padx=(0 if index == 0 else 5, 5)
             )
 
             tk.Label(
                 card,
-                text=f"CLIENT {i+1}",
+                text=f"CLIENT {index + 1}",
                 bg=self.PANEL_2,
                 fg=self.BLUE,
                 font=("Segoe UI Semibold", 9)
-            ).pack(anchor="w", padx=10, pady=(8, 3))
+            ).pack(
+                anchor="w",
+                padx=10,
+                pady=(8, 3)
+            )
 
-            name_var = tk.StringVar(value=name)
-            ip_var = tk.StringVar(value=ip)
+            name_var = tk.StringVar(
+                value=name
+            )
+
+            ip_var = tk.StringVar(
+                value=old_ip
+            )
 
             ttk.Entry(
                 card,
                 textvariable=name_var
-            ).pack(fill="x", padx=10, pady=(0, 4))
+            ).pack(
+                fill="x",
+                padx=10,
+                pady=(0, 4)
+            )
 
-            # Hidden selection bar: it is a compact combobox that expands
-            # only when the user clicks the IP field.
-            ip_combo = ttk.Combobox(
+            combo = ttk.Combobox(
                 card,
                 textvariable=ip_var,
-                values=self._available_ip_values(ip),
                 state="normal"
             )
-            ip_combo.pack(fill="x", padx=10, pady=(0, 9))
 
-            ip_combo.bind(
-                "<<ComboboxSelected>>",
-                lambda event, row_index=i: self._ip_selected(row_index)
+            combo["values"] = self._available_ip_values(
+                old_ip
             )
-            ip_combo.bind(
+
+            combo.pack(
+                fill="x",
+                padx=10,
+                pady=(0, 9)
+            )
+
+            combo.bind(
                 "<Button-1>",
-                lambda event, row_index=i: self._refresh_combo_values(row_index)
+                lambda event, i=index:
+                    self._refresh_combo(i)
+            )
+
+            combo.bind(
+                "<<ComboboxSelected>>",
+                lambda event, i=index:
+                    self._ip_selected(i)
             )
 
             self.client_rows.append({
                 "name_var": name_var,
                 "ip_var": ip_var,
-                "ip_combo": ip_combo,
+                "ip_combo": combo
             })
 
-    def _available_ip_values(self, current_ip=""):
+        self._refresh_all_combos()
+
+    def _available_ip_values(self, current=""):
+
         used = {
-            row["ip_var"].get().strip()
+            clean_ip(
+                row["ip_var"].get()
+            )
             for row in self.client_rows
             if row["ip_var"].get().strip()
         }
 
-        # Keep the current row's existing value visible while editing it.
+        current = clean_ip(current)
+
         values = [
-            ip for ip in self.discovered_ips
-            if ip not in used or ip == current_ip
+            ip
+            for ip in self.discovered_ips
+            if ip not in used or ip == current
         ]
 
-        if current_ip and current_ip not in values:
-            values.insert(0, current_ip)
+        if current and current not in values:
+            values.insert(0, current)
 
         return values
 
-    def _refresh_combo_values(self, row_index):
-        if row_index >= len(self.client_rows):
+    def _refresh_combo(self, index):
+
+        if index >= len(self.client_rows):
             return
 
-        combo = self.client_rows[row_index]["ip_combo"]
-        current = self.client_rows[row_index]["ip_var"].get().strip()
-        combo["values"] = self._available_ip_values(current)
+        row = self.client_rows[index]
 
-    def _ip_selected(self, row_index):
-        selected = self.client_rows[row_index]["ip_var"].get().strip()
+        current = clean_ip(
+            row["ip_var"].get()
+        )
 
-        # Prevent duplicate selection immediately.
+        row["ip_combo"]["values"] = (
+            self._available_ip_values(current)
+        )
+
+    def _refresh_all_combos(self):
+
+        for index in range(
+            len(self.client_rows)
+        ):
+            self._refresh_combo(index)
+
+    def _ip_selected(self, index):
+
+        if index >= len(self.client_rows):
+            return
+
+        selected = clean_ip(
+            self.client_rows[index]["ip_var"].get()
+        )
+
+        if not selected:
+            return
+
         duplicates = [
-            i for i, row in enumerate(self.client_rows)
-            if i != row_index and row["ip_var"].get().strip() == selected
+            row
+            for i, row in enumerate(self.client_rows)
+            if i != index
+            and clean_ip(
+                row["ip_var"].get()
+            ) == selected
         ]
 
         if duplicates:
-            self.client_rows[row_index]["ip_var"].set("")
-            self._refresh_combo_values(row_index)
+
+            self.client_rows[index]["ip_var"].set("")
+
+            self._refresh_all_combos()
+
             messagebox.showwarning(
                 "IP already selected",
-                f"{selected} is already assigned to another client."
+                f"{selected} is already assigned."
             )
+
             return
 
-        # Refresh every other combo so this IP disappears from their list.
-        for i, row in enumerate(self.client_rows):
-            if i != row_index:
-                current = row["ip_var"].get().strip()
-                row["ip_combo"]["values"] = self._available_ip_values(current)
+        self._refresh_all_combos()
+
+    # ------------------------------------------------------------------
+    # LAN scan
+    # ------------------------------------------------------------------
 
     def scan_lan(self):
+
         if self.discovery_running:
             return
 
         self.discovery_running = True
-        self._set_status("● SCANNING LAN...", self.BLUE)
+
         self.discovery_var.set(
-            "LAN scan: discovering active devices..."
+            "Scanning LAN..."
+        )
+
+        self._set_status(
+            "● SCANNING LAN...",
+            self.BLUE
         )
 
         threading.Thread(
-            target=self._scan_lan_thread,
+            target=self._scan_thread,
             daemon=True
         ).start()
 
-    def _scan_lan_thread(self):
+    def _scan_thread(self):
+
         try:
-            ips = discover_lan_ips()
+            ips, method = discover_lan_ips()
+
             self.after(
                 0,
-                lambda: self._apply_discovered_ips(ips)
-            )
-        except Exception as exc:
-            self.after(
-                0,
-                lambda: self._lan_scan_failed(exc)
+                lambda result_ips=ips, result_method=method:
+                    self._apply_discovery(
+                        result_ips,
+                        result_method
+                    )
             )
 
-    def _apply_discovered_ips(self, ips):
+        except Exception as exc:
+
+            error_message = str(exc)
+
+            self.after(
+                0,
+                lambda message=error_message:
+                    self._scan_failed(message)
+            )
+
+    def _apply_discovery(
+        self,
+        ips,
+        method
+    ):
+
         self.discovery_running = False
+
         self.discovered_ips = ips
 
-        for row in self.client_rows:
-            current = row["ip_var"].get().strip()
-            row["ip_combo"]["values"] = self._available_ip_values(current)
+        self._refresh_all_combos()
 
         self.discovery_var.set(
-            f"LAN scan: {len(ips)} device(s) discovered — "
-            "click an IP field to choose"
+            f"{len(ips)} device(s) found • {method}"
         )
 
         self._set_status(
             f"● {len(ips)} LAN DEVICES FOUND",
-            self.GREEN if ips else self.RED
+            self.GREEN if ips else self.YELLOW
         )
 
         if ips:
+
             self._write_output(
-                "LAN discovery completed.\n"
-                "Discovered IPs: " + ", ".join(ips) + "\n"
-            )
-        else:
-            self._write_output(
-                "LAN discovery found no devices.\n"
-                "Install nmap for reliable -sn discovery, or verify "
-                "that the machine is connected to the LAN.\n"
+                "\nLAN DISCOVERY\n"
+                + "-" * 60
+                + "\n"
+                + f"Method: {method}\n"
+                + "IPs:\n"
+                + "\n".join(
+                    f"  • {ip}"
+                    for ip in ips
+                )
+                + "\n"
             )
 
-    def _lan_scan_failed(self, exc):
+        else:
+
+            self._write_output(
+                "\nLAN discovery found no devices.\n"
+                "Make sure the machine is connected to the LAN.\n"
+            )
+
+    def _scan_failed(self, message):
+
         self.discovery_running = False
-        self._set_status("● LAN SCAN ERROR", self.RED)
-        self.discovery_var.set("LAN scan failed")
-        self._write_output(f"LAN scan error: {exc}\n")
+
+        self.discovery_var.set(
+            "LAN scan failed"
+        )
+
+        self._set_status(
+            "● LAN SCAN ERROR",
+            self.RED
+        )
+
+        self._write_output(
+            f"\nLAN scan error:\n{message}\n"
+        )
+
+    # ------------------------------------------------------------------
+    # Dashboard
+    # ------------------------------------------------------------------
 
     def _build_dashboard(self):
-        wrapper = tk.Frame(self, bg=self.BG)
-        wrapper.pack(fill="both", expand=True, padx=24, pady=(0, 8))
 
-        left = ttk.Frame(wrapper, style="Panel.TFrame")
-        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        wrapper = tk.Frame(
+            self,
+            bg=self.BG
+        )
 
-        right = ttk.Frame(wrapper, style="Panel.TFrame")
-        right.pack(side="right", fill="both", expand=True, padx=(8, 0))
+        wrapper.pack(
+            fill="both",
+            expand=True,
+            padx=25,
+            pady=(0, 8)
+        )
+
+        left = ttk.Frame(
+            wrapper,
+            style="Panel.TFrame"
+        )
+
+        left.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=(0, 8)
+        )
+
+        right = ttk.Frame(
+            wrapper,
+            style="Panel.TFrame"
+        )
+
+        right.pack(
+            side="right",
+            fill="both",
+            expand=True,
+            padx=(8, 0)
+        )
 
         ttk.Label(
             left,
             text="CLIENT RESOURCE COMPARISON",
             style="PanelTitle.TLabel"
-        ).pack(anchor="w", padx=14, pady=(12, 7))
+        ).pack(
+            anchor="w",
+            padx=14,
+            pady=(12, 7)
+        )
 
-        columns = ("client", "ip", "os", "cpu", "ram", "score", "state")
+        columns = (
+            "client",
+            "ip",
+            "os",
+            "cpu",
+            "ram",
+            "net",
+            "score",
+            "state"
+        )
+
         self.tree = ttk.Treeview(
             left,
             columns=columns,
             show="headings",
-            height=10
+            height=9
         )
 
         headings = {
@@ -801,122 +1288,291 @@ class SchedulerGUI(tk.Tk):
             "os": "OS",
             "cpu": "CPU %",
             "ram": "RAM %",
+            "net": "NET",
             "score": "XGB SCORE",
             "state": "STATE"
         }
 
         widths = {
-            "client": 105,
-            "ip": 130,
-            "os": 80,
-            "cpu": 70,
-            "ram": 70,
-            "score": 90,
-            "state": 85
+            "client": 100,
+            "ip": 120,
+            "os": 75,
+            "cpu": 60,
+            "ram": 60,
+            "net": 60,
+            "score": 85,
+            "state": 75
         }
 
-        for col in columns:
-            self.tree.heading(col, text=headings[col])
-            self.tree.column(col, width=widths[col], anchor="center")
+        for column in columns:
 
-        self.tree.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+            self.tree.heading(
+                column,
+                text=headings[column]
+            )
+
+            self.tree.column(
+                column,
+                width=widths[column],
+                anchor="center"
+            )
+
+        self.tree.pack(
+            fill="both",
+            expand=True,
+            padx=12,
+            pady=(0, 10)
+        )
 
         ttk.Label(
             right,
             text="SCHEDULER DECISION",
             style="PanelTitle.TLabel"
-        ).pack(anchor="w", padx=14, pady=(12, 7))
+        ).pack(
+            anchor="w",
+            padx=14,
+            pady=(12, 7)
+        )
 
-        self.selected_var = tk.StringVar(value="No client selected")
+        self.selected_var = tk.StringVar(
+            value="No client selected"
+        )
+
         tk.Label(
             right,
             textvariable=self.selected_var,
             bg=self.PANEL,
             fg=self.BLUE,
             font=("Segoe UI Semibold", 20)
-        ).pack(anchor="w", padx=16, pady=(8, 2))
+        ).pack(
+            anchor="w",
+            padx=16,
+            pady=(7, 1)
+        )
 
-        self.score_var = tk.StringVar(value="XGBoost score: —")
+        self.score_var = tk.StringVar(
+            value="XGBoost score: —"
+        )
+
         tk.Label(
             right,
             textvariable=self.score_var,
             bg=self.PANEL,
             fg=self.TEXT,
-            font=("Segoe UI", 10)
-        ).pack(anchor="w", padx=16, pady=(0, 10))
+            justify="left",
+            font=("Segoe UI", 9)
+        ).pack(
+            anchor="w",
+            padx=16,
+            pady=(0, 8)
+        )
+
+        self.metric_frame = tk.Frame(
+            right,
+            bg=self.PANEL
+        )
+
+        self.metric_frame.pack(
+            fill="x",
+            padx=16,
+            pady=(0, 8)
+        )
+
+        self.metric_vars = {}
+
+        for title, key in [
+            ("CPU", "cpu"),
+            ("RAM", "ram"),
+            ("NET", "net")
+        ]:
+
+            box = tk.Frame(
+                self.metric_frame,
+                bg=self.PANEL_3,
+                highlightbackground=self.BORDER,
+                highlightthickness=1
+            )
+
+            box.pack(
+                side="left",
+                fill="x",
+                expand=True,
+                padx=(0, 5)
+            )
+
+            tk.Label(
+                box,
+                text=title,
+                bg=self.PANEL_3,
+                fg=self.MUTED,
+                font=("Segoe UI", 8)
+            ).pack(
+                anchor="w",
+                padx=8,
+                pady=(6, 0)
+            )
+
+            var = tk.StringVar(
+                value="—"
+            )
+
+            self.metric_vars[key] = var
+
+            tk.Label(
+                box,
+                textvariable=var,
+                bg=self.PANEL_3,
+                fg=self.BLUE,
+                font=("Segoe UI Semibold", 13)
+            ).pack(
+                anchor="w",
+                padx=8,
+                pady=(0, 6)
+            )
 
         ttk.Label(
             right,
             text="Task command",
             style="TLabel"
-        ).pack(anchor="w", padx=16)
+        ).pack(
+            anchor="w",
+            padx=16
+        )
 
-        self.command_var = tk.StringVar(value="python3 --version")
+        self.command_var = tk.StringVar(
+            value="python3 --version"
+        )
+
         ttk.Entry(
             right,
             textvariable=self.command_var
-        ).pack(fill="x", padx=16, pady=(5, 9))
+        ).pack(
+            fill="x",
+            padx=16,
+            pady=(4, 8)
+        )
 
         ttk.Button(
             right,
             text="RUN TASK ON SELECTED CLIENT",
             style="Accent.TButton",
             command=self.run_selected_task
-        ).pack(fill="x", padx=16, pady=(2, 8))
+        ).pack(
+            fill="x",
+            padx=16,
+            pady=(2, 7)
+        )
 
         ttk.Button(
             right,
             text="AUTO SELECT + RUN TASK",
             command=self.auto_select_and_run
-        ).pack(fill="x", padx=16, pady=(0, 12))
+        ).pack(
+            fill="x",
+            padx=16,
+            pady=(0, 10)
+        )
 
         self.output_text = tk.Text(
             right,
-            bg="#08101a",
-            fg="#cfe4ff",
+            bg="#06101a",
+            fg="#cfe7ff",
             insertbackground=self.TEXT,
             relief="flat",
             wrap="word",
-            font=("Consolas", 9),
-            height=9
+            font=("Consolas", 8),
+            height=8
         )
-        self.output_text.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+
+        self.output_text.pack(
+            fill="both",
+            expand=True,
+            padx=16,
+            pady=(0, 13)
+        )
+
         self.output_text.insert(
             "end",
             "Scheduler response will appear here...\n"
         )
-        self.output_text.configure(state="disabled")
+
+        self.output_text.configure(
+            state="disabled"
+        )
+
+        self.tree.bind(
+            "<<TreeviewSelect>>",
+            self._table_selection_changed
+        )
+
+    # ------------------------------------------------------------------
+    # Better graph
+    # ------------------------------------------------------------------
 
     def _build_graph(self):
-        graph_panel = ttk.Frame(self, style="Panel.TFrame")
-        graph_panel.pack(fill="both", expand=True, padx=24, pady=(0, 8))
+
+        graph_panel = ttk.Frame(
+            self,
+            style="Panel.TFrame"
+        )
+
+        graph_panel.pack(
+            fill="both",
+            expand=True,
+            padx=25,
+            pady=(0, 8)
+        )
+
+        header = tk.Frame(
+            graph_panel,
+            bg=self.PANEL
+        )
+
+        header.pack(
+            fill="x",
+            padx=14,
+            pady=(9, 2)
+        )
 
         ttk.Label(
-            graph_panel,
-            text="LIVE CPU / RAM UTILIZATION",
+            header,
+            text="LIVE RESOURCE TELEMETRY",
             style="PanelTitle.TLabel"
-        ).pack(anchor="w", padx=14, pady=(10, 2))
+        ).pack(
+            side="left"
+        )
+
+        tk.Label(
+            header,
+            text="CPU solid • RAM dashed • transparent blue",
+            bg=self.PANEL,
+            fg=self.MUTED,
+            font=("Segoe UI", 8)
+        ).pack(
+            side="right"
+        )
 
         self.figure = Figure(
-            figsize=(8, 2.7),
+            figsize=(10, 3.2),
             dpi=100,
             facecolor=self.PANEL
         )
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_facecolor(self.PANEL)
-        self.ax.tick_params(colors=self.MUTED, labelsize=8)
-        for spine in self.ax.spines.values():
-            spine.set_color(self.BORDER)
 
-        self.ax.set_ylim(0, 100)
-        self.ax.set_ylabel("Utilization %", color=self.MUTED, fontsize=9)
-        self.ax.set_xlabel("Sample", color=self.MUTED, fontsize=9)
-        self.ax.grid(alpha=0.12, color="white")
+        self.ax = self.figure.add_subplot(
+            111
+        )
+
+        self.ax.set_facecolor(
+            self.PANEL_3
+        )
+
+        self._style_graph_axes()
 
         self.canvas = FigureCanvasTkAgg(
             self.figure,
             master=graph_panel
         )
+
         self.canvas.get_tk_widget().pack(
             fill="both",
             expand=True,
@@ -924,106 +1580,318 @@ class SchedulerGUI(tk.Tk):
             pady=(0, 10)
         )
 
-    def _build_footer(self):
-        footer = tk.Frame(self, bg=self.BG)
-        footer.pack(fill="x", padx=24, pady=(0, 14))
+    def _style_graph_axes(self):
 
-        self.last_update_var = tk.StringVar(value="Last update: —")
+        self.ax.set_ylim(
+            0,
+            100
+        )
+
+        self.ax.set_ylabel(
+            "Utilization %",
+            color=self.MUTED,
+            fontsize=8
+        )
+
+        self.ax.set_xlabel(
+            "Telemetry sample",
+            color=self.MUTED,
+            fontsize=8
+        )
+
+        self.ax.tick_params(
+            colors=self.MUTED,
+            labelsize=7
+        )
+
+        self.ax.grid(
+            alpha=0.12,
+            color="white",
+            linestyle="--",
+            linewidth=0.7
+        )
+
+        for spine in self.ax.spines.values():
+            spine.set_color(
+                self.BORDER
+            )
+
+    def _redraw_graph(self):
+
+        self.ax.clear()
+
+        self.ax.set_facecolor(
+            self.PANEL_3
+        )
+
+        self._style_graph_axes()
+
+        for name, data in self.history.items():
+
+            if not data["cpu"]:
+                continue
+
+            x = list(
+                range(
+                    len(data["cpu"])
+                )
+            )
+
+            cpu = data["cpu"]
+            ram = data["ram"]
+
+            self.ax.plot(
+                x,
+                cpu,
+                color=self.BLUE,
+                linewidth=2.0,
+                alpha=0.95,
+                label=f"{name} CPU"
+            )
+
+            self.ax.fill_between(
+                x,
+                cpu,
+                alpha=0.10,
+                color=self.BLUE
+            )
+
+            self.ax.plot(
+                x,
+                ram,
+                color=self.BLUE_LIGHT,
+                linewidth=1.25,
+                linestyle="--",
+                alpha=0.70,
+                label=f"{name} RAM"
+            )
+
+        if self.history:
+
+            legend = self.ax.legend(
+                loc="upper left",
+                fontsize=7,
+                frameon=False,
+                ncol=2
+            )
+
+            for text in legend.get_texts():
+                text.set_color(
+                    self.TEXT
+                )
+
+        self.figure.tight_layout(
+            pad=1.0
+        )
+
+        self.canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # Footer
+    # ------------------------------------------------------------------
+
+    def _build_footer(self):
+
+        footer = tk.Frame(
+            self,
+            bg=self.BG
+        )
+
+        footer.pack(
+            fill="x",
+            padx=25,
+            pady=(0, 13)
+        )
+
+        self.last_update_var = tk.StringVar(
+            value="Last update: —"
+        )
+
         tk.Label(
             footer,
             textvariable=self.last_update_var,
             bg=self.BG,
             fg=self.MUTED,
             font=("Segoe UI", 8)
-        ).pack(side="left")
+        ).pack(
+            side="left"
+        )
 
         tk.Label(
             footer,
-            text="XGBoost • Flask • psutil",
+            text="XGBoost • Flask • psutil • LAN",
             bg=self.BG,
             fg=self.MUTED,
             font=("Segoe UI", 8)
-        ).pack(side="right")
+        ).pack(
+            side="right"
+        )
 
-    # ---------------- Data/config ----------------
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
 
     def _set_from_config(self, workers):
-        self.count_var.set(str(len(workers)))
 
-        # Temporarily create correct number of rows.
+        self.count_var.set(
+            str(
+                max(
+                    1,
+                    len(workers)
+                )
+            )
+        )
+
         self._rebuild_client_inputs()
 
-        for row, worker in zip(self.client_rows, workers):
-            row["name_var"].set(worker.get("name", "Client"))
-            url = worker.get("url", "")
-            ip = url.replace("http://", "").replace("https://", "")
-            ip = ip.rsplit(":", 1)[0]
-            row["ip_var"].set(ip)
+        for row, worker in zip(
+            self.client_rows,
+            workers
+        ):
+
+            row["name_var"].set(
+                worker.get(
+                    "name",
+                    "Client"
+                )
+            )
+
+            row["ip_var"].set(
+                clean_ip(
+                    worker.get(
+                        "url",
+                        ""
+                    )
+                )
+            )
+
+        self._refresh_all_combos()
 
     def _current_workers(self):
+
         rows = []
-        for i, row in enumerate(self.client_rows, start=1):
-            name = row["name_var"].get().strip() or f"Client-{i}"
-            ip = row["ip_var"].get().strip()
+
+        seen = set()
+
+        for index, row in enumerate(
+            self.client_rows,
+            start=1
+        ):
+
+            name = (
+                row["name_var"].get().strip()
+                or f"Client-{index}"
+            )
+
+            ip = clean_ip(
+                row["ip_var"].get()
+            )
 
             if not ip:
                 continue
 
+            if ip in seen:
+
+                messagebox.showwarning(
+                    "Duplicate IP",
+                    f"{ip} is assigned more than once."
+                )
+
+                continue
+
+            seen.add(ip)
+
             rows.append({
                 "name": name,
-                "url": f"http://{ip}:5000"
+                "url": f"http://{ip}:{FLASK_PORT}"
             })
 
         return rows
 
     def _save_and_export(self):
+
         workers = self._current_workers()
 
         if not workers:
+
             messagebox.showwarning(
                 "No clients",
-                "Enter at least one client IP address."
+                "Select or enter at least one client IP."
             )
+
             return
 
         try:
-            save_config(workers)
-            export_workers_to_scheduler(workers)
+
+            save_config(
+                workers
+            )
+
+            export_workers_to_scheduler(
+                workers
+            )
+
         except Exception as exc:
-            messagebox.showerror(
+
+            self._show_error(
                 "Save failed",
                 str(exc)
             )
+
             return
 
-        self._set_status("● CONFIGURATION SAVED", self.GREEN)
-        self._write_output(
-            "Configuration saved to scheduler_workers.json\n"
-            f"Workers exported to: {SCHEDULER_PATH}\n"
+        self._set_status(
+            "● CONFIGURATION SAVED",
+            self.GREEN
         )
 
-    # ---------------- Polling / graph ----------------
+        self._write_output(
+            "\nConfiguration saved.\n"
+            f"Workers exported to:\n{SCHEDULER_PATH}\n"
+        )
+
+    # ------------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------------
 
     def refresh_now(self):
+
+        if self.refresh_running:
+            return
+
         workers = self._current_workers()
 
         if not workers:
-            self._write_output("Enter at least one client IP address.\n")
+
+            self._write_output(
+                "\nEnter/select client IP addresses first.\n"
+            )
+
             return
 
-        self._set_status("● CHECKING CLIENTS...", self.BLUE)
+        self.refresh_running = True
+
+        self._set_status(
+            "● CHECKING CLIENTS...",
+            self.BLUE
+        )
 
         threading.Thread(
-            target=self._refresh_worker_thread,
+            target=self._refresh_thread,
             args=(workers,),
             daemon=True
         ).start()
 
-    def _refresh_worker_thread(self, workers):
+    def _refresh_thread(self, workers):
+
         results = []
 
         for worker in workers:
-            info = get_info(worker)
+
+            info = get_info(
+                worker
+            )
+
             results.append({
                 "worker": worker,
                 "info": info
@@ -1031,27 +1899,37 @@ class SchedulerGUI(tk.Tk):
 
         self.after(
             0,
-            lambda: self._apply_snapshot(results)
+            lambda result=results:
+                self._apply_snapshot(result)
         )
 
     def _apply_snapshot(self, results):
+
+        self.refresh_running = False
+
         self.last_snapshot = results
 
         for child in self.tree.get_children():
             self.tree.delete(child)
 
         for item in results:
+
             worker = item["worker"]
             info = item["info"]
 
             if "error" in info:
+
                 self.tree.insert(
                     "",
                     "end",
                     iid=worker["url"],
                     values=(
                         worker["name"],
-                        worker["url"].replace("http://", ""),
+                        worker["url"].replace(
+                            "http://",
+                            ""
+                        ),
+                        "—",
                         "—",
                         "—",
                         "—",
@@ -1059,7 +1937,12 @@ class SchedulerGUI(tk.Tk):
                         "OFFLINE"
                     )
                 )
+
                 continue
+
+            cpu = info["cpu"]
+            ram = info["memory"]
+            net = info["network"]
 
             self.tree.insert(
                 "",
@@ -1067,117 +1950,139 @@ class SchedulerGUI(tk.Tk):
                 iid=worker["url"],
                 values=(
                     worker["name"],
-                    worker["url"].replace("http://", ""),
+                    worker["url"].replace(
+                        "http://",
+                        ""
+                    ),
                     info["os"],
-                    f"{info['cpu']:.1f}",
-                    f"{info['memory']:.1f}",
+                    f"{cpu:.1f}",
+                    f"{ram:.1f}",
+                    f"{net:.1f}",
                     "—",
                     "ONLINE"
                 )
             )
 
             name = worker["name"]
-            self.history.setdefault(name, {"cpu": [], "ram": []})
-            self.history[name]["cpu"].append(info["cpu"])
-            self.history[name]["ram"].append(info["memory"])
 
-            self.history[name]["cpu"] = self.history[name]["cpu"][-self.max_history:]
-            self.history[name]["ram"] = self.history[name]["ram"][-self.max_history:]
+            self.history.setdefault(
+                name,
+                {
+                    "cpu": [],
+                    "ram": []
+                }
+            )
+
+            self.history[name]["cpu"].append(
+                cpu
+            )
+
+            self.history[name]["ram"].append(
+                ram
+            )
+
+            self.history[name]["cpu"] = (
+                self.history[name]["cpu"][
+                    -self.max_history:
+                ]
+            )
+
+            self.history[name]["ram"] = (
+                self.history[name]["ram"][
+                    -self.max_history:
+                ]
+            )
 
         self._redraw_graph()
 
         online = sum(
-            1 for item in results if "error" not in item["info"]
+            1
+            for item in results
+            if "error" not in item["info"]
         )
 
         self._set_status(
             f"● {online}/{len(results)} CLIENTS ONLINE",
             self.GREEN if online else self.RED
         )
+
         self.last_update_var.set(
-            "Last update: " + datetime.now().strftime("%H:%M:%S")
+            "Last update: "
+            + datetime.now().strftime(
+                "%H:%M:%S"
+            )
         )
 
-    def _redraw_graph(self):
-        self.ax.clear()
-        self.ax.set_facecolor(self.PANEL)
+    # ------------------------------------------------------------------
+    # Selection
+    # ------------------------------------------------------------------
 
-        self.ax.set_ylim(0, 100)
-        self.ax.set_ylabel("Utilization %", color=self.MUTED, fontsize=9)
-        self.ax.set_xlabel("Sample", color=self.MUTED, fontsize=9)
-        self.ax.tick_params(colors=self.MUTED, labelsize=8)
-        self.ax.grid(alpha=0.12, color="white")
+    def _table_selection_changed(self, event=None):
 
-        for spine in self.ax.spines.values():
-            spine.set_color(self.BORDER)
+        selection = self.tree.selection()
 
-        first = True
-        for name, data in self.history.items():
-            if not data["cpu"]:
-                continue
+        if not selection:
+            return
 
-            x = list(range(len(data["cpu"])))
+        url = selection[0]
 
-            # Transparent blue CPU fill/line.
-            self.ax.plot(
-                x,
-                data["cpu"],
-                color="#35a7ff",
-                linewidth=1.8,
-                label=f"{name} CPU"
-            )
-            self.ax.fill_between(
-                x,
-                data["cpu"],
-                alpha=0.12,
-                color="#35a7ff"
-            )
+        item = next(
+            (
+                x
+                for x in self.last_snapshot
+                if x["worker"]["url"] == url
+            ),
+            None
+        )
 
-            # RAM is shown as a dashed blue trace so CPU/RAM remain
-            # distinguishable while preserving the requested blue theme.
-            self.ax.plot(
-                x,
-                data["ram"],
-                color="#65c5ff",
-                linewidth=1.2,
-                linestyle="--",
-                alpha=0.65,
-                label=f"{name} RAM"
-            )
+        if not item:
+            return
 
-            first = False
+        if "error" in item["info"]:
+            return
 
-        if not first:
-            legend = self.ax.legend(
-                loc="upper left",
-                fontsize=7,
-                frameon=False
-            )
-            for text in legend.get_texts():
-                text.set_color(self.TEXT)
+        self.selected_worker = item["worker"]
 
-        self.figure.tight_layout(pad=1.1)
-        self.canvas.draw_idle()
+        info = item["info"]
 
-    # ---------------- Scheduling ----------------
+        self.selected_var.set(
+            f"{item['worker']['name']} • "
+            f"{info['os']}"
+        )
 
-    def _online_snapshot(self):
-        return [
-            item for item in self.last_snapshot
-            if "error" not in item["info"]
-        ]
+        self.metric_vars["cpu"].set(
+            f"{info['cpu']:.1f}%"
+        )
+
+        self.metric_vars["ram"].set(
+            f"{info['memory']:.1f}%"
+        )
+
+        self.metric_vars["net"].set(
+            f"{info['network']:.1f}"
+        )
+
+    # ------------------------------------------------------------------
+    # XGBoost execution
+    # ------------------------------------------------------------------
 
     def auto_select_and_run(self):
+
         workers = self._current_workers()
 
         if not workers:
+
             messagebox.showwarning(
                 "No clients",
-                "Enter client IP addresses first."
+                "Select or enter client IP addresses first."
             )
+
             return
 
-        self._set_status("● XGBOOST SELECTING...", self.BLUE)
+        self._set_status(
+            "● XGBOOST SELECTING...",
+            self.BLUE
+        )
 
         threading.Thread(
             target=self._auto_select_thread,
@@ -1186,181 +2091,394 @@ class SchedulerGUI(tk.Tk):
         ).start()
 
     def _auto_select_thread(self, workers):
+
         try:
+
             model = load_model()
+
         except Exception as exc:
+
+            error_message = str(exc)
+
             self.after(
                 0,
-                lambda: self._show_error("Model error", str(exc))
+                lambda message=error_message:
+                    self._show_error(
+                        "XGBoost model error",
+                        message
+                    )
             )
+
             return
 
         available = []
 
+        latest = []
+
         for worker in workers:
-            info = get_info(worker)
+
+            info = get_info(
+                worker
+            )
+
+            latest.append({
+                "worker": worker,
+                "info": info
+            })
+
             if "error" not in info:
+
                 available.append({
                     "worker": worker,
                     "info": info
                 })
 
         if not available:
+
             self.after(
                 0,
-                lambda: self._show_error(
-                    "No clients available",
-                    "None of the configured Flask agents responded on port 5000."
-                )
+                lambda:
+                    self._show_error(
+                        "No clients available",
+                        "No configured Flask agent responded on port 5000."
+                    )
             )
+
             return
 
-        best = find_best_worker(model, available)
+        try:
+
+            best = find_best_worker(
+                model,
+                available
+            )
+
+        except Exception as exc:
+
+            error_message = str(exc)
+
+            self.after(
+                0,
+                lambda message=error_message:
+                    self._show_error(
+                        "XGBoost prediction error",
+                        message
+                    )
+            )
+
+            return
 
         self.after(
             0,
-            lambda: self._selected_and_run(best)
+            lambda snapshot=latest, selected=best:
+                self._apply_model_result(
+                    snapshot,
+                    selected
+                )
         )
 
-    def _selected_and_run(self, best):
+    def _apply_model_result(
+        self,
+        snapshot,
+        best
+    ):
+
+        self._apply_snapshot(
+            snapshot
+        )
+
         if not best:
-            self._show_error("Selection failed", "XGBoost did not select a client.")
+
+            self._show_error(
+                "Selection failed",
+                "XGBoost did not select a client."
+            )
+
             return
 
         worker = best["worker"]
         info = best["info"]
         probs = best["probabilities"]
 
-        # Refresh the table with the latest model-selection score.
-        for item in self.last_snapshot:
-            if item["worker"]["url"] == worker["url"]:
-                break
+        self.selected_worker = worker
 
         self.selected_var.set(
-            f"{worker['name']}  •  {info['os']}"
+            f"{worker['name']} • "
+            f"{info['os']}"
         )
+
         self.score_var.set(
-            "XGBoost score: "
-            f"{probs['selected'] * 100:.2f}%  |  "
-            f"Windows: {probs['windows'] * 100:.2f}%  |  "
-            f"Kali: {probs['kali'] * 100:.2f}%"
+            "Selected class: "
+            f"{probs['selected_class']}\n"
+            f"Selected probability: "
+            f"{probs['selected'] * 100:.2f}%   |   "
+            f"Windows: "
+            f"{probs['windows'] * 100:.2f}%   |   "
+            f"Kali/Linux: "
+            f"{probs['kali'] * 100:.2f}%"
+        )
+
+        self.metric_vars["cpu"].set(
+            f"{info['cpu']:.1f}%"
+        )
+
+        self.metric_vars["ram"].set(
+            f"{info['memory']:.1f}%"
+        )
+
+        self.metric_vars["net"].set(
+            f"{info['network']:.1f}"
+        )
+
+        # Highlight selected worker.
+        self.tree.selection_set(
+            worker["url"]
         )
 
         self._write_output(
-            f"[{datetime.now().strftime('%H:%M:%S')}] "
-            f"Selected {worker['name']} ({worker['url']})\n"
-            f"OS: {info['os']}\n"
-            f"CPU: {info['cpu']:.1f}% | RAM: {info['memory']:.1f}%\n"
-            f"XGBoost selected-class probability: "
-            f"{probs['selected'] * 100:.2f}%\n\n"
+            "\n"
+            + "=" * 72
+            + "\n"
+            + "XGBOOST SCHEDULER DECISION\n"
+            + "=" * 72
+            + "\n"
+            + f"Selected client : {worker['name']}\n"
+            + f"Endpoint        : {worker['url']}\n"
+            + f"OS              : {info['os']}\n"
+            + f"CPU             : {info['cpu']:.2f}%\n"
+            + f"RAM             : {info['memory']:.2f}%\n"
+            + f"Network         : {info['network']:.2f}\n"
+            + f"Windows prob.   : {probs['windows'] * 100:.2f}%\n"
+            + f"Kali/Linux prob.: {probs['kali'] * 100:.2f}%\n"
+            + f"Selected prob.  : {probs['selected'] * 100:.2f}%\n"
+            + "=" * 72
+            + "\n"
         )
 
-        # Run the existing Flask /run endpoint.
-        self._set_status("● RUNNING REMOTE TASK...", self.BLUE)
+        self._set_status(
+            "● XGBOOST SELECTED CLIENT",
+            self.GREEN
+        )
+
+        # Execute the existing project's /run endpoint.
+        self._set_status(
+            "● RUNNING REMOTE TASK...",
+            self.BLUE
+        )
+
+        command = self.command_var.get().strip()
 
         threading.Thread(
-            target=self._run_task_thread,
-            args=(worker,),
+            target=self._task_thread,
+            args=(worker, command),
             daemon=True
         ).start()
 
     def run_selected_task(self):
-        selection = self.tree.selection()
 
-        if not selection:
-            messagebox.showinfo(
-                "Select a client",
-                "Select an ONLINE client from the table first."
-            )
-            return
-
-        url = selection[0]
-        worker = next(
-            (w for w in self._current_workers() if w["url"] == url),
-            None
-        )
+        worker = self.selected_worker
 
         if not worker:
+
+            selection = self.tree.selection()
+
+            if selection:
+
+                worker = next(
+                    (
+                        w
+                        for w in self._current_workers()
+                        if w["url"] == selection[0]
+                    ),
+                    None
+                )
+
+        if not worker:
+
+            messagebox.showinfo(
+                "Select a client",
+                "Select an online client first."
+            )
+
             return
 
-        self.selected_var.set(worker["name"])
-        self._set_status("● RUNNING REMOTE TASK...", self.BLUE)
+        self.selected_worker = worker
+
+        command = self.command_var.get().strip()
+
+        self._set_status(
+            "● RUNNING REMOTE TASK...",
+            self.BLUE
+        )
 
         threading.Thread(
-            target=self._run_task_thread,
-            args=(worker,),
+            target=self._task_thread,
+            args=(worker, command),
             daemon=True
         ).start()
 
-    def _run_task_thread(self, worker):
+    def _task_thread(
+        self,
+        worker,
+        command
+    ):
+
         try:
-            # The supplied Linux and Windows resource agents currently
-            # ignore the JSON command and execute their OS-specific task
-            # file from the /run endpoint. Therefore the GUI calls /run
-            # directly, preserving the project's current behavior.
-            response = requests.post(
-                worker["url"] + "/run",
-                json={"command": self.command_var.get().strip()},
-                timeout=90
+
+            result = run_remote_task(
+                worker,
+                command
             )
-            response.raise_for_status()
-            result = response.json()
 
             self.after(
                 0,
-                lambda: self._show_task_result(worker, result)
+                lambda task_result=result,
+                       selected_worker=worker:
+                    self._show_task_result(
+                        selected_worker,
+                        task_result
+                    )
             )
 
         except Exception as exc:
-            self.after(
-                0,
-                lambda: self._show_error(
-                    "Task execution failed",
-                    f"{worker['name']} ({worker['url']})\n\n{exc}"
-                )
+
+            error_message = (
+                f"{worker['name']} "
+                f"({worker['url']})\n\n"
+                f"{exc}"
             )
 
-    def _show_task_result(self, worker, result):
-        success = result.get("success", False)
-        output = result.get("output", "")
-        error = result.get("error", "")
-        return_code = result.get("return_code", "—")
+            self.after(
+                0,
+                lambda message=error_message:
+                    self._show_error(
+                        "Task execution failed",
+                        message
+                    )
+            )
+
+    def _show_task_result(
+        self,
+        worker,
+        result
+    ):
+
+        success = bool(
+            result.get(
+                "success",
+                False
+            )
+        )
+
+        output = result.get(
+            "output",
+            ""
+        )
+
+        error = result.get(
+            "error",
+            ""
+        )
+
+        return_code = result.get(
+            "return_code",
+            "—"
+        )
 
         self._write_output(
-            "\n" + "=" * 68 + "\n"
-            f"REMOTE TASK RESULT — {worker['name']}\n"
-            + "=" * 68 + "\n"
-            f"Success: {success}\n"
-            f"Return code: {return_code}\n\n"
-            f"OUTPUT:\n{output}\n"
-            f"ERROR:\n{error}\n"
+            "\n"
+            + "=" * 72
+            + "\n"
+            + f"REMOTE TASK RESULT — {worker['name']}\n"
+            + "=" * 72
+            + "\n"
+            + f"Success: {success}\n"
+            + f"Return code: {return_code}\n\n"
+            + "OUTPUT:\n"
+            + str(output)
+            + "\n\n"
+            + "ERROR:\n"
+            + str(error)
+            + "\n"
         )
 
         self._set_status(
-            "● TASK COMPLETED" if success else "● TASK FAILED",
-            self.GREEN if success else self.RED
+            "● TASK COMPLETED"
+            if success
+            else "● TASK FAILED",
+            self.GREEN
+            if success
+            else self.RED
         )
 
-    # ---------------- Misc ----------------
+    # ------------------------------------------------------------------
+    # Misc helpers
+    # ------------------------------------------------------------------
 
     def _write_output(self, text):
-        self.output_text.configure(state="normal")
-        self.output_text.insert("end", text)
-        self.output_text.see("end")
-        self.output_text.configure(state="disabled")
 
-    def _show_error(self, title, message):
-        self._set_status("● ERROR", self.RED)
-        self._write_output(f"\nERROR: {message}\n")
-        messagebox.showerror(title, message)
+        self.output_text.configure(
+            state="normal"
+        )
 
-    def _set_status(self, text, color):
-        self.status_var.set(text)
-        self.status_label.configure(fg=color)
+        self.output_text.insert(
+            "end",
+            text
+        )
 
+        self.output_text.see(
+            "end"
+        )
+
+        self.output_text.configure(
+            state="disabled"
+        )
+
+    def _show_error(
+        self,
+        title,
+        message
+    ):
+
+        self._set_status(
+            "● ERROR",
+            self.RED
+        )
+
+        self._write_output(
+            "\nERROR: "
+            + message
+            + "\n"
+        )
+
+        messagebox.showerror(
+            title,
+            message
+        )
+
+    def _set_status(
+        self,
+        text,
+        color
+    ):
+
+        self.status_var.set(
+            text
+        )
+
+        self.status_label.configure(
+            fg=color
+        )
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 
 def main():
+
     app = SchedulerGUI()
+
     app.mainloop()
 
 
